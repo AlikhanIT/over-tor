@@ -27,15 +27,57 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// =============================================================
+// ЛОКАЛЬНЫЙ КОНФИГ — просто меняй значения ниже
+// =============================================================
+
+// URL для скачивания. Если задан — CLI-аргумент игнорируется.
+// Оставь "", чтобы передавать URL через командную строку.
+var cfgURL = "https://nbg1-speed.hetzner.com/100MB.bin"
+
+// Количество параллельных Tor-цепочек
+var cfgCircuits = 20
+
+// Папка назначения ("." = текущая директория)
+var cfgDestination = "."
+
+// Перезаписывать файл и создавать папки, если их нет
+var cfgForce = false
+
+// Минимальное время жизни цепочки (секунды)
+var cfgMinLifetime = 10
+
+// Принудительное имя выходного файла ("" = из URL)
+var cfgName = ""
+
+// Подавить обычный вывод (только ошибки)
+var cfgQuiet = false
+
+// Подавить весь вывод включая ошибки
+var cfgSilent = false
+
+// Порт Tor SOCKS-прокси
+var cfgTorPort = 9050
+
+// Подробный вывод диагностики
+var cfgVerbose = false
+
+// Разрешить HTTP (не рекомендуется)
+var cfgAllowHTTP = false
+
+// =============================================================
 
 type chunk struct {
 	start   int64
@@ -364,7 +406,115 @@ func (s *State) getOutputFilepath() {
 
 	s.output = filepath.Join(destination, filename)
 }
+func renewTorCircuit() error {
+	conn, err := net.Dial("tcp", "127.0.0.1:9051")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
+	// если CookieAuth — можно без AUTH (зависит от конфига)
+	_, err = fmt.Fprintf(conn, "AUTHENTICATE\r\n")
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, 256)
+	conn.Read(buf)
+
+	_, err = fmt.Fprintf(conn, "SIGNAL NEWNYM\r\n")
+	if err != nil {
+		return err
+	}
+
+	conn.Read(buf)
+	return nil
+}
+func isTorError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+
+	return strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "tls") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "x509")
+}
+func (s *State) headWithRetries(maxAttempts int) (*http.Response, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		client := httpClient(fmt.Sprintf("tordl-head-%d", attempt))
+
+		req, err := http.NewRequest("GET", s.src, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Range", "bytes=0-0")
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Connection", "keep-alive")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+
+			if isTorError(err) {
+				if s.verbose {
+					s.log <- "Tor error detected, rotating circuit..."
+				}
+				_ = renewTorCircuit()
+				time.Sleep(2 * time.Second)
+			}
+
+			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			lastErr = fmt.Errorf("unexpected HTTP status: %d", resp.StatusCode)
+			resp.Body.Close()
+
+			_ = renewTorCircuit()
+			continue
+		}
+
+		// 🔥 вытаскиваем реальный размер
+		var size int64 = -1
+
+		if cr := resp.Header.Get("Content-Range"); cr != "" {
+			// bytes 0-0/123456
+			if parts := strings.Split(cr, "/"); len(parts) == 2 {
+				if v, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					size = v
+				}
+			}
+		} else if resp.ContentLength > 0 {
+			size = resp.ContentLength
+		}
+
+		if size <= 0 {
+			lastErr = errors.New("failed to retrieve download length")
+			resp.Body.Close()
+			continue
+		}
+
+		// 💡 ВАЖНО: проставляем правильный размер
+		resp.ContentLength = size
+
+		// 💡 дочитываем и закрываем body (иначе утечки + keep-alive ломается)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("HEAD request failed after %d attempts: %w", maxAttempts, lastErr)
+}
 func (s *State) Fetch(src string) int {
 	var stop_status chan bool
 	s.src = src
@@ -378,16 +528,14 @@ func (s *State) Fetch(src string) int {
 	}
 	fmt.Fprintf(messageWriter, "Output file:\t\t%s\n", s.output)
 
-	// Get the target length
-	client := httpClient("tordl")
-	resp, err := client.Head(s.src)
+	// Get the target length with retries and circuit/IP rotation.
+	resp, err := s.headWithRetries(10)
 	if err != nil {
-		fmt.Fprintf(errorWriter, "ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
+		fmt.Fprintf(errorWriter, "ERROR - Unable to prepare download over Tor: %v\n", err)
 		return 1
 	}
-	if resp.ContentLength <= 0 {
-		fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
-		return 1
+	if resp.Body != nil {
+		resp.Body.Close()
 	}
 	s.bytesTotal = resp.ContentLength
 	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.bytesTotal)))
@@ -510,34 +658,35 @@ var errorWriter io.Writer
 var messageWriter io.Writer
 
 func init() {
-	// Set up CLI arguments
-	flag.BoolVar(&allowHttp, "allow-http", false, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
+	// Применяем localDebug как дефолты для флагов.
+	// Если задан localDebug.URL — CLI-аргументы URL не нужны.
+	flag.BoolVar(&allowHttp, "allow-http", cfgAllowHTTP, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
 
-	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
-	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
+	flag.IntVar(&circuits, "circuits", cfgCircuits, "Concurrent circuits.")
+	flag.IntVar(&circuits, "c", cfgCircuits, "Concurrent circuits.")
 
-	flag.StringVar(&destination, "destination", ".", "Output directory.")
-	flag.StringVar(&destination, "d", ".", "Output directory.")
+	flag.StringVar(&destination, "destination", cfgDestination, "Output directory.")
+	flag.StringVar(&destination, "d", cfgDestination, "Output directory.")
 
-	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
+	flag.BoolVar(&force, "force", cfgForce, "Will create parent folder(s) and/or overwrite existing files.")
 
-	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
-	flag.IntVar(&minLifetime, "l", 10, "Minimum circuit lifetime. (seconds)")
+	flag.IntVar(&minLifetime, "min-lifetime", cfgMinLifetime, "Minimum circuit lifetime. (seconds)")
+	flag.IntVar(&minLifetime, "l", cfgMinLifetime, "Minimum circuit lifetime. (seconds)")
 
-	flag.StringVar(&name, "name", "", "Output filename.")
-	flag.StringVar(&name, "n", "", "Output filename.")
+	flag.StringVar(&name, "name", cfgName, "Output filename.")
+	flag.StringVar(&name, "n", cfgName, "Output filename.")
 
-	flag.BoolVar(&quiet, "quiet", false, "Suppress most text output (still show errors).")
-	flag.BoolVar(&quiet, "q", false, "Suppress most text output (still show errors).")
+	flag.BoolVar(&quiet, "quiet", cfgQuiet, "Suppress most text output (still show errors).")
+	flag.BoolVar(&quiet, "q", cfgQuiet, "Suppress most text output (still show errors).")
 
-	flag.BoolVar(&silent, "silent", false, "Suppress all text output (including errors).")
-	flag.BoolVar(&silent, "s", false, "Suppress all text output (including errors).")
+	flag.BoolVar(&silent, "silent", cfgSilent, "Suppress all text output (including errors).")
+	flag.BoolVar(&silent, "s", cfgSilent, "Suppress all text output (including errors).")
 
-	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
-	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
+	flag.IntVar(&torPort, "tor-port", cfgTorPort, "Port your Tor service is listening on.")
+	flag.IntVar(&torPort, "p", cfgTorPort, "Port your Tor service is listening on.")
 
-	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
-	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
+	flag.BoolVar(&verbose, "verbose", cfgVerbose, "Show diagnostic details.")
+	flag.BoolVar(&verbose, "v", cfgVerbose, "Show diagnostic details.")
 
 	// Custom usage message to avoid duplicate entries for long & short flags
 	flag.Usage = func() {
@@ -575,7 +724,10 @@ Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
 
 func main() {
 	flag.Parse()
-	if flag.NArg() < 1 {
+
+	// Если в localDebug.URL задан URL — используем его напрямую, CLI-аргумент не нужен.
+	// Если localDebug.URL пустой — ждём URL из командной строки.
+	if cfgURL == "" && flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(0)
 	}
@@ -597,7 +749,11 @@ func main() {
 
 	var uris []string
 
-	if flag.NArg() == 1 {
+	// Приоритет: cfgURL > CLI-аргументы
+	if cfgURL != "" {
+		fmt.Fprintln(messageWriter, "[localDebug] Используется URL из кода:", cfgURL)
+		uris = append(uris, cfgURL)
+	} else if flag.NArg() == 1 {
 		// Only one non-flag argument. Check if it's a URL or a text file
 		if _, err := os.Stat(flag.Arg(0)); err == nil {
 			// Found a file on disk, read URLs from it
