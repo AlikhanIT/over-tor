@@ -37,6 +37,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // =============================================================
@@ -77,6 +79,12 @@ var cfgVerbose = false
 // Разрешить HTTP (не рекомендуется)
 var cfgAllowHTTP = false
 
+// Размер буфера чтения/записи для каждого чанка
+var cfgChunkBufferSize = 256 * 1024
+
+// Задержка между стартом чанков; 0ms = максимум скорости, 10-50ms = мягче для Tor
+var cfgChunkStartDelay time.Duration = 0
+
 // =============================================================
 
 type chunk struct {
@@ -105,6 +113,7 @@ type State struct {
 }
 
 const torBlock = 8000 // The longest plain text block in Tor
+const minChunkSplitSize = 256 * 1024
 
 // Basic function to determine human-readable file sizes
 func humanReadableSize(sizeInBytes float32) string {
@@ -124,14 +133,41 @@ func humanReadableSize(sizeInBytes float32) string {
 }
 
 func httpClient(user string) *http.Client {
-	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
+	auth := &proxy.Auth{User: user, Password: user}
+	baseDialer := &net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	socksDialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", torPort), auth, baseDialer)
 	if err != nil {
-		fmt.Fprintf(errorWriter, "ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
+		fmt.Fprintf(errorWriter, "ERROR - Failed to create SOCKS5 dialer with user '%s' and port '%d'\n%v", user, torPort, err)
 		os.Exit(1)
 	}
 
+	transport := &http.Transport{
+		Proxy:                 nil,
+		ForceAttemptHTTP2:     false,
+		DisableCompression:    true,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	if contextDialer, ok := socksDialer.(proxy.ContextDialer); ok {
+		transport.DialContext = contextDialer.DialContext
+	} else {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return socksDialer.Dial(network, addr)
+		}
+	}
+
 	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
+		Transport: transport,
+		Timeout:   0,
 	}
 }
 
@@ -172,6 +208,9 @@ func (s *State) chunkInit(id int) (client *http.Client, req *http.Request) {
 	s.chunks[id].cancel = cancel
 	client = httpClient(fmt.Sprintf("tg%d", s.chunks[id].circuit))
 	req, _ = http.NewRequestWithContext(ctx, "GET", s.src, nil)
+	req.Header.Set("User-Agent", "tor-dl/1.0")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "keep-alive")
 	req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d",
 		s.chunks[id].start, s.chunks[id].start+s.chunks[id].length-1))
 	return
@@ -219,26 +258,37 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 	}
 
 	// Copy network data to the output file
-	buffer := make([]byte, torBlock)
+	bufferSize := cfgChunkBufferSize
+	if bufferSize < torBlock {
+		bufferSize = torBlock
+	}
+	buffer := make([]byte, bufferSize)
 	for {
 		n, err := resp.Body.Read(buffer)
 		if n > 0 {
-			file.Write(buffer[:n])
-			// Enough to RLock(), as we only modify our own chunk
-			s.rwmutex.RLock()
+			if _, writeErr := file.Write(buffer[:n]); writeErr != nil {
+				s.log <- fmt.Sprintf("File Write: %s", writeErr.Error())
+				break
+			}
+			s.rwmutex.Lock()
 			if int64(n) < s.chunks[id].length {
 				s.chunks[id].start += int64(n)
 				s.chunks[id].length -= int64(n)
 				s.chunks[id].bytes += int64(n)
 			} else {
+				s.chunks[id].bytes += int64(n)
 				s.chunks[id].length = 0
 			}
-			s.rwmutex.RUnlock()
-			if s.chunks[id].length == 0 {
+			remaining := s.chunks[id].length
+			s.rwmutex.Unlock()
+			if remaining == 0 {
 				break
 			}
 		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			s.log <- fmt.Sprintf("ReadCloser Read: %s", err.Error())
 			break
 		}
@@ -467,11 +517,13 @@ func (s *State) headWithRetries(maxAttempts int) (*http.Response, error) {
 				if s.verbose {
 					s.log <- "Tor error detected, rotating circuit..."
 				}
-				_ = renewTorCircuit()
-				time.Sleep(2 * time.Second)
+				if attempt%3 == 0 {
+					_ = renewTorCircuit()
+					time.Sleep(1200 * time.Millisecond)
+				}
 			}
 
-			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 			continue
 		}
 
@@ -479,7 +531,9 @@ func (s *State) headWithRetries(maxAttempts int) (*http.Response, error) {
 			lastErr = fmt.Errorf("unexpected HTTP status: %d", resp.StatusCode)
 			resp.Body.Close()
 
-			_ = renewTorCircuit()
+			if attempt%3 == 0 {
+				_ = renewTorCircuit()
+			}
 			continue
 		}
 
@@ -542,15 +596,27 @@ func (s *State) Fetch(src string) int {
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
-	if file != nil {
-		file.Close()
-	}
 	if err != nil {
 		fmt.Fprintln(messageWriter, err.Error())
 		return 1
 	}
+	if truncErr := file.Truncate(s.bytesTotal); truncErr != nil {
+		s.log <- fmt.Sprintf("File Truncate: %s", truncErr.Error())
+	}
+	file.Close()
 
 	// Initialize chunks
+	if s.bytesTotal > 0 {
+		maxUsefulCircuits := int(s.bytesTotal / minChunkSplitSize)
+		if maxUsefulCircuits < 1 {
+			maxUsefulCircuits = 1
+		}
+		if maxUsefulCircuits < s.circuits {
+			s.circuits = maxUsefulCircuits
+			s.chunks = make([]chunk, s.circuits)
+		}
+	}
+
 	chunkLen := s.bytesTotal / int64(s.circuits)
 	seq := 0
 	for id := range s.circuits {
@@ -584,7 +650,9 @@ func (s *State) Fetch(src string) int {
 		for id := range s.circuits {
 			client, req := s.chunkInit(id)
 			go s.chunkFetch(id, client, req)
-			time.Sleep(499 * time.Millisecond) // Be gentle to the local tor daemon
+			if cfgChunkStartDelay > 0 {
+				time.Sleep(cfgChunkStartDelay)
+			}
 		}
 	}()
 
@@ -622,7 +690,7 @@ func (s *State) Fetch(src string) int {
 					stop_status <- true
 					return 0
 				}
-				if s.chunks[longest].length <= 5*torBlock {
+				if s.chunks[longest].length <= minChunkSplitSize {
 					// Too short to split
 					continue
 				}
